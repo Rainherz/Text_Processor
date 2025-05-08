@@ -1,3 +1,4 @@
+
 import threading
 import time
 from time import sleep
@@ -120,7 +121,7 @@ class RpcClient(object):
             
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop)
         self.heartbeat_thread.daemon = True
-        self.heartbeat.start()
+        self.heartbeat_thread.start()  # CORREGIDO: era self.heartbeat.start()
 
     def _process_data_events(self):
         """Procesar eventos con manejo de errores y reconexión"""
@@ -139,22 +140,28 @@ class RpcClient(object):
                 self._reconnect()
 
     def _heartbeat_loop(self):
-        """Enviar heartbeats periódicamente para mantener la conexión viva"""
+        """Mantener la conexión viva enviando un comando liviano periódicamente"""
         while self.should_reconnect:
             try:
                 if self.connection and self.connection.is_open:
-                    # Enviar un heartbeat manual
-                    self.connection.heartbeat.send_heartbeat()
-                    # Verificar estado de la conexión
-                    if not self.connection.is_open:
-                        self._reconnect()
+                    # En lugar de send_heartbeat(), usamos un comando liviano
+                    # para mantener la conexión activa
+                    self.channel.basic.publish(
+                        body='',
+                        exchange='',
+                        routing_key='',
+                        properties={
+                            'delivery_mode': 1  # No persistente
+                        }
+                    )
             except Exception as e:
                 APP_STATUS["errors"] += 1
                 APP_STATUS["last_error"] = f"Heartbeat error: {str(e)}"
                 print(f"[Cliente] Error en heartbeat: {str(e)}")
                 
                 # Intentar reconectar si el error es de conexión
-                self._reconnect()
+                if self.connection and not self.connection.is_open:
+                    self._reconnect()
                 
             # Dormir por menos tiempo que el intervalo de heartbeat
             time.sleep(self.heartbeat // 2)
@@ -313,12 +320,20 @@ class TextProcessingServer(object):
         self.heartbeat_thread.start()
                 
     def _heartbeat_loop(self):
-        """Enviar heartbeats periódicamente"""
+        """Mantener la conexión viva enviando un comando liviano periódicamente"""
         while self.should_reconnect:
             try:
                 if self.connection and self.connection.is_open:
-                    # Enviar heartbeat manual
-                    self.connection.heartbeat.send_heartbeat()
+                    # En lugar de send_heartbeat(), usamos un comando liviano
+                    # para mantener la conexión activa
+                    self.channel.basic.publish(
+                        body='',
+                        exchange='',
+                        routing_key='',
+                        properties={
+                            'delivery_mode': 1  # No persistente
+                        }
+                    )
             except Exception as e:
                 APP_STATUS["errors"] += 1
                 APP_STATUS["last_error"] = f"Servidor heartbeat error: {str(e)}"
