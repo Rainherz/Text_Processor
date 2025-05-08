@@ -1,0 +1,259 @@
+{% extends "base.html" %}
+
+{% block title %}TextPro RPC - Procesamiento de Texto{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-lg-8">
+        <!-- Tarjeta Principal -->
+        <div class="card main-card mb-4">
+            <div class="card-header">
+                <h2><i class="bi bi-gear-wide-connected"></i> Procesador de Texto RPC</h2>
+                <p class="text-muted mb-0">Transforma tu texto con operaciones avanzadas</p>
+            </div>
+            <div class="card-body">
+                <form id="text-form" action="{{ url_for('process_text') }}" method="post">
+                    <!-- Selección de Operación -->
+                    <div class="mb-4">
+                        <label for="operation" class="form-label">Selecciona una operación</label>
+                        <div class="operations-container">
+                            {% for op in operations %}
+                            <div class="form-check operation-option">
+                                <input class="form-check-input" type="radio" name="operation" id="op-{{ op.id }}" value="{{ op.id }}" {% if loop.first %}checked{% endif %}>
+                                <label class="form-check-label d-flex align-items-center" for="op-{{ op.id }}">
+                                    <i class="bi bi-{{ op.icon }} me-2"></i>
+                                    <div>
+                                        <div class="operation-title">{{ op.name }}</div>
+                                        <div class="operation-description">{{ op.description }}</div>
+                                    </div>
+                                </label>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    
+                    <!-- Entrada de Texto -->
+                    <div class="mb-4">
+                        <label for="text" class="form-label">Texto a procesar</label>
+                        <textarea class="form-control" id="text" name="text" rows="5" placeholder="Ingresa el texto que quieres procesar..." required></textarea>
+                    </div>
+                    
+                    <!-- Vista Previa -->
+                    <div class="preview-container mb-4" style="display: none;">
+                        <label class="form-label">Vista previa</label>
+                        <div class="card">
+                            <div class="card-body">
+                                <div id="preview-content">...</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Botones -->
+                    <div class="d-flex justify-content-between align-items-center">
+                        <button type="button" class="btn btn-outline-secondary" id="preview-btn">
+                            <i class="bi bi-eye"></i> Vista previa
+                        </button>
+                        <button type="submit" class="btn btn-primary" id="process-btn" {% if not connected %}disabled{% endif %}>
+                            <i class="bi bi-lightning-charge"></i> Procesar texto
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        
+        <!-- Tarjeta de Resultado -->
+        <div class="card result-card mb-4" style="display: none;">
+            <div class="card-header">
+                <h3><i class="bi bi-check-circle"></i> Resultado</h3>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <label class="form-label">Operación aplicada</label>
+                    <div class="operation-badge" id="result-operation">-</div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Resultado</label>
+                    <div class="result-container" id="result-content">-</div>
+                </div>
+                <div class="d-flex justify-content-end">
+                    <button type="button" class="btn btn-sm btn-outline-secondary me-2" id="copy-result">
+                        <i class="bi bi-clipboard"></i> Copiar
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-primary" id="back-to-input">
+                        <i class="bi bi-arrow-left"></i> Volver
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-lg-4">
+        <!-- Tarjeta de Estado -->
+        <div class="card status-card mb-4">
+            <div class="card-header">
+                <h3><i class="bi bi-info-circle"></i> Estado</h3>
+            </div>
+            <div class="card-body">
+                <div class="d-flex align-items-center mb-3">
+                    <div class="status-indicator me-3 {% if connected %}connected{% else %}disconnected{% endif %}">
+                        <i class="bi {% if connected %}bi-cloud-check{% else %}bi-cloud-slash{% endif %}"></i>
+                    </div>
+                    <div>
+                        <h5 class="mb-0">Servidor RPC</h5>
+                        <p class="text-muted mb-0">
+                            {% if connected %}
+                                Conectado y funcionando
+                            {% else %}
+                                Desconectado
+                            {% endif %}
+                        </p>
+                    </div>
+                </div>
+                
+                <div class="mt-3">
+                    <a href="{{ url_for('health_check') }}" class="btn btn-sm btn-outline-secondary" target="_blank">
+                        <i class="bi bi-activity"></i> Verificar estado
+                    </a>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Tarjeta de Historial -->
+        <div class="card history-card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h3 class="mb-0"><i class="bi bi-clock-history"></i> Historial</h3>
+                <form action="{{ url_for('clear_history') }}" method="post">
+                    <button type="submit" class="btn btn-sm btn-outline-danger" {% if not history %}disabled{% endif %}>
+                        <i class="bi bi-trash"></i>
+                    </button>
+                </form>
+            </div>
+            <div class="card-body">
+                {% if history %}
+                    <div class="history-list">
+                        {% for item in history %}
+                            <div class="history-item">
+                                <div class="history-time">{{ item.timestamp }}</div>
+                                <div class="history-op">{{ item.operation }}</div>
+                                <div class="history-text">{{ item.input_text[:30] }}{% if item.input_text|length > 30 %}...{% endif %}</div>
+                                <div class="history-result">{{ item.result[:30] }}{% if item.result|length > 30 %}...{% endif %}</div>
+                            </div>
+                        {% endfor %}
+                    </div>
+                {% else %}
+                    <div class="text-center py-5">
+                        <i class="bi bi-clock-history text-muted" style="font-size: 2rem;"></i>
+                        <p class="text-muted mt-3">No hay operaciones en el historial</p>
+                    </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    $(document).ready(function() {
+        // Gestionar el envío AJAX del formulario
+        $('#text-form').on('submit', function(e) {
+            e.preventDefault();
+            
+            $('#process-btn').prop('disabled', true).html('<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Procesando...');
+            
+            $.ajax({
+                url: $(this).attr('action'),
+                type: 'POST',
+                data: $(this).serialize(),
+                dataType: 'json',
+                success: function(response) {
+                    showResult(response.operation, response.result);
+                },
+                error: function() {
+                    alert('Error al procesar la solicitud');
+                },
+                complete: function() {
+                    $('#process-btn').prop('disabled', false).html('<i class="bi bi-lightning-charge"></i> Procesar texto');
+                }
+            });
+        });
+        
+        // Botón de vista previa
+        $('#preview-btn').on('click', function() {
+            var text = $('#text').val();
+            var operation = $('input[name="operation"]:checked').val();
+            
+            if (text) {
+                // Simulación simple de vista previa
+                let previewText = text;
+                
+                switch(operation) {
+                    case 'mayusculas':
+                        previewText = text.toUpperCase();
+                        break;
+                    case 'minusculas':
+                        previewText = text.toLowerCase();
+                        break;
+                    case 'invertir':
+                        previewText = text.split('').reverse().join('');
+                        break;
+                    case 'longitud':
+                        previewText = 'Longitud: ' + text.length + ' caracteres';
+                        break;
+                    case 'capitalizar':
+                        previewText = text.charAt(0).toUpperCase() + text.slice(1);
+                        break;
+                    case 'titulo':
+                        previewText = text.replace(/\w\S*/g, (txt) => {
+                            return txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase();
+                        });
+                        break;
+                    case 'intercambiar_caso':
+                        previewText = text.split('').map(c => {
+                            if (c === c.toUpperCase()) return c.toLowerCase();
+                            return c.toUpperCase();
+                        }).join('');
+                        break;
+                    case 'contar_palabras':
+                        previewText = 'Palabras: ' + text.split(/\s+/).filter(word => word.length > 0).length;
+                        break;
+                    case 'recortar':
+                        previewText = text.trim();
+                        break;
+                }
+                
+                $('#preview-content').text(previewText);
+                $('.preview-container').slideDown(300);
+            } else {
+                alert('Por favor, ingresa algún texto para la vista previa');
+            }
+        });
+        
+        // Mostrar resultado
+        function showResult(operation, result) {
+            $('#result-operation').text(operation);
+            $('#result-content').text(result);
+            $('.main-card').hide();
+            $('.result-card').show();
+        }
+        
+        // Volver al formulario
+        $('#back-to-input').on('click', function() {
+            $('.result-card').hide();
+            $('.main-card').show();
+        });
+        
+        // Copiar resultado
+        $('#copy-result').on('click', function() {
+            var resultText = $('#result-content').text();
+            navigator.clipboard.writeText(resultText).then(function() {
+                var originalText = $('#copy-result').html();
+                $('#copy-result').html('<i class="bi bi-check"></i> Copiado');
+                setTimeout(function() {
+                    $('#copy-result').html(originalText);
+                }, 2000);
+            });
+        });
+    });
+</script>
+{% endblock %}
