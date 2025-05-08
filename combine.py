@@ -120,7 +120,7 @@ class RpcClient(object):
             
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop)
         self.heartbeat_thread.daemon = True
-        self.heartbeat_thread.start()
+        self.heartbeat.start()
 
     def _process_data_events(self):
         """Procesar eventos con manejo de errores y reconexión"""
