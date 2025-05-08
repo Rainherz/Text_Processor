@@ -119,6 +119,12 @@ class TextProcessingServer(object):
 
 
 if __name__ == "__main__":
+     # Obtener el puerto del entorno de Render
+    port = int(os.environ.get('PORT', 10000))
+    print(f"Iniciando aplicación web en puerto: {port}")
+    # Importante: usar 0.0.0.0 para escuchar en todas las interfaces
+    app.run(host='0.0.0.0', port=port)
+    
     # Imprimir información de debug para ayudar a solucionar problemas
     print(f"Iniciando servidor RPC con:")
     print(f"Host: {RABBIT_HOST}, Puerto: {RABBIT_PORT}, SSL: {RABBIT_SSL}")
