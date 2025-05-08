@@ -3,40 +3,43 @@ from urllib.parse import urlparse
 import amqpstorm
 from amqpstorm import Message
 
-# Obtener URL de CloudAMQP desde variable de entorno
-amqp_url = os.environ.get('CLOUDAMQP_URL', 'amqp://guest:guest@localhost:5672/%2f')
+# Configuración de CloudAMQP
+CLOUDAMQP_URL = os.environ.get('CLOUDAMQP_URL', 'amqps://tnluigbk:x9gWN83qzJ3CIZjiKKAyg327wKNb9eA1@porpoise.rmq.cloudamqp.com/tnluigbk')
+url = urlparse(CLOUDAMQP_URL)
 
-# Parsear URL para extraer componentes
-url = urlparse(amqp_url)
-
-# Configuración de RabbitMQ
-host = url.hostname
-username = url.username
-password = url.password
-vhost = url.path[1:] if url.path else '%2f'
-rpc_queue = 'rpc_queue'
-
+# Extraer componentes de la URL
+RABBIT_HOST = url.hostname
+RABBIT_USER = url.username
+RABBIT_PASSWORD = url.password
+RABBIT_VHOST = url.path[1:] if url.path else '%2f'
+RABBIT_PORT = 5671  # Puerto para TLS
+RABBIT_SSL = True   # Habilitar SSL para conexión segura
+RPC_QUEUE = 'rpc_queue'
 
 class TextProcessingServer(object):
     """Servidor RPC para operaciones de procesamiento de texto."""
     
-    def __init__(self, host, username, password, rpc_queue, vhost):
+    def __init__(self, host, username, password, rpc_queue, vhost, port=5671, ssl=True):
         self.host = host
         self.username = username
         self.password = password
         self.rpc_queue = rpc_queue
         self.vhost = vhost
+        self.port = port
+        self.ssl = ssl
         self.connection = None
         self.channel = None
         
     def start(self):
         """Iniciar el servidor RPC."""
-        # Crear conexión
+        # Crear conexión con soporte SSL/TLS
         self.connection = amqpstorm.Connection(
             self.host, 
-            self.username, 
+            self.username,
             self.password,
-            virtual_host=self.vhost
+            virtual_host=self.vhost,
+            port=self.port,
+            ssl=self.ssl
         )
         # Crear canal
         self.channel = self.connection.channel()
@@ -116,9 +119,24 @@ class TextProcessingServer(object):
 
 
 if __name__ == "__main__":
+    # Imprimir información de debug para ayudar a solucionar problemas
+    print(f"Iniciando servidor RPC con:")
+    print(f"Host: {RABBIT_HOST}, Puerto: {RABBIT_PORT}, SSL: {RABBIT_SSL}")
+    print(f"Usuario: {RABBIT_USER}, vhost: {RABBIT_VHOST}")
+    
     # Crear e iniciar el servidor
-    server = TextProcessingServer(host, username, password, rpc_queue, vhost)
+    server = TextProcessingServer(
+        RABBIT_HOST, 
+        RABBIT_USER, 
+        RABBIT_PASSWORD, 
+        RPC_QUEUE,
+        RABBIT_VHOST,
+        RABBIT_PORT,
+        RABBIT_SSL
+    )
     try:
         server.start()
     except KeyboardInterrupt:
-            print("Servidor detenido por el usuario")
+        print("Servidor detenido por el usuario")
+    except Exception as e:
+        print(f"Error al iniciar el servidor: {str(e)}")
