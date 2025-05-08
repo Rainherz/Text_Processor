@@ -1,4 +1,5 @@
 import threading
+import time
 from time import sleep
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session, flash
 import amqpstorm
@@ -23,18 +24,21 @@ RABBIT_VHOST = url.path[1:] if url.path else '%2f'
 RABBIT_PORT = 5671  # Puerto para TLS
 RABBIT_SSL = True   # Habilitar SSL para conexión segura
 RPC_QUEUE = 'rpc_queue'
+HEARTBEAT_INTERVAL = 30  # Reducir el intervalo de heartbeat a 30 segundos
 
-# Estado global del servidor
-SERVER_STATUS = {
-    "running": False,
+# Estado global
+APP_STATUS = {
+    "client_connected": False,
+    "server_running": False,
     "processed_messages": 0,
-    "errors": 0
+    "errors": 0,
+    "last_error": None,
+    "last_reconnect": None
 }
 
-# Cliente RPC
+# Clase de Cliente RPC mejorada
 class RpcClient(object):
-    """Asynchronous Rpc client."""
-    def __init__(self, host, username, password, rpc_queue, vhost, port=5671, ssl=True):
+    def __init__(self, host, username, password, rpc_queue, vhost, port=5671, ssl=True, heartbeat=30):
         self.queue = {}
         self.host = host
         self.username = username
@@ -42,79 +46,191 @@ class RpcClient(object):
         self.vhost = vhost
         self.port = port
         self.ssl = ssl
+        self.heartbeat = heartbeat
         self.channel = None
         self.connection = None
         self.callback_queue = None
         self.rpc_queue = rpc_queue
+        self.consumer_thread = None
+        self.heartbeat_thread = None
+        self.should_reconnect = True
         self.open()
 
     def open(self):
-        """Open Connection."""
+        """Abrir conexión con manejo de errores y reconexión"""
+        if self.connection and self.connection.is_open:
+            return True
+        
         try:
-            # Crear conexión con soporte SSL/TLS
+            print(f"[Cliente] Conectando a RabbitMQ: {self.host}:{self.port}")
+            # Configurar conexión con tiempo de heartbeat reducido
             self.connection = amqpstorm.Connection(
                 self.host, 
                 self.username,
                 self.password,
                 virtual_host=self.vhost,
                 port=self.port,
-                ssl=self.ssl
+                ssl=self.ssl,
+                heartbeat=self.heartbeat
             )
+            
             self.channel = self.connection.channel()
+            # Asegurar que la cola RPC exista
             self.channel.queue.declare(self.rpc_queue)
+            
+            # Crear cola de respuestas exclusiva
             result = self.channel.queue.declare(exclusive=True)
             self.callback_queue = result['queue']
+            
+            # Configurar consumidor
             self.channel.basic.consume(self._on_response, no_ack=True,
-                                    queue=self.callback_queue)
+                                      queue=self.callback_queue)
+            
+            # Iniciar hilo de consumo
             self._create_process_thread()
+            
+            # Iniciar hilo de heartbeat
+            self._create_heartbeat_thread()
+            
+            print(f"[Cliente] Conectado exitosamente a RabbitMQ")
+            APP_STATUS["client_connected"] = True
+            APP_STATUS["last_reconnect"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
             return True
         except Exception as e:
-            print(f"Error al conectar con RabbitMQ: {str(e)}")
+            APP_STATUS["client_connected"] = False
+            APP_STATUS["errors"] += 1
+            APP_STATUS["last_error"] = str(e)
+            print(f"[Cliente] Error al conectar con RabbitMQ: {str(e)}")
             return False
 
     def _create_process_thread(self):
-        """Create a thread responsible for consuming messages in response
-         to RPC requests.
-        """
-        thread = threading.Thread(target=self._process_data_events)
-        thread.setDaemon(True)
-        thread.start()
+        """Crear hilo para procesar mensajes"""
+        if self.consumer_thread and self.consumer_thread.is_alive():
+            return
+            
+        self.consumer_thread = threading.Thread(target=self._process_data_events)
+        self.consumer_thread.daemon = True
+        self.consumer_thread.start()
+
+    def _create_heartbeat_thread(self):
+        """Crear hilo para enviar heartbeats"""
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            return
+            
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop)
+        self.heartbeat_thread.daemon = True
+        self.heartbeat_thread.start()
 
     def _process_data_events(self):
-        """Process Data Events using the Process Thread."""
-        self.channel.start_consuming(to_tuple=False)
+        """Procesar eventos con manejo de errores y reconexión"""
+        while self.should_reconnect:
+            try:
+                if self.connection and self.connection.is_open:
+                    self.channel.start_consuming(to_tuple=False)
+            except Exception as e:
+                APP_STATUS["errors"] += 1
+                APP_STATUS["last_error"] = str(e)
+                print(f"[Cliente] Error en hilo de consumo: {str(e)}")
+                APP_STATUS["client_connected"] = False
+                
+                # Intentar reconectar
+                time.sleep(5)  # Esperar antes de reconectar
+                self._reconnect()
+
+    def _heartbeat_loop(self):
+        """Enviar heartbeats periódicamente para mantener la conexión viva"""
+        while self.should_reconnect:
+            try:
+                if self.connection and self.connection.is_open:
+                    # Enviar un heartbeat manual
+                    self.connection.heartbeat.send_heartbeat()
+                    # Verificar estado de la conexión
+                    if not self.connection.is_open:
+                        self._reconnect()
+            except Exception as e:
+                APP_STATUS["errors"] += 1
+                APP_STATUS["last_error"] = f"Heartbeat error: {str(e)}"
+                print(f"[Cliente] Error en heartbeat: {str(e)}")
+                
+                # Intentar reconectar si el error es de conexión
+                self._reconnect()
+                
+            # Dormir por menos tiempo que el intervalo de heartbeat
+            time.sleep(self.heartbeat // 2)
+
+    def _reconnect(self):
+        """Intentar reconectar al servidor RabbitMQ"""
+        if not self.should_reconnect:
+            return
+            
+        print("[Cliente] Intentando reconectar...")
+        
+        # Cerrar conexiones existentes
+        try:
+            if self.connection:
+                self.connection.close()
+        except:
+            pass
+            
+        # Intentar reconectar
+        self.open()
 
     def _on_response(self, message):
-        """On Response store the message with the correlation id in a local
-         dictionary.
-        """
-        self.queue[message.correlation_id] = message.body
+        """Manejar respuestas"""
+        try:
+            self.queue[message.correlation_id] = message.body
+        except Exception as e:
+            APP_STATUS["errors"] += 1
+            APP_STATUS["last_error"] = str(e)
+            print(f"[Cliente] Error en manejador de respuestas: {str(e)}")
 
     def send_request(self, payload):
+        """Enviar solicitud con manejo de errores"""
         try:
-            # Create the Message object.
+            # Verificar y reconectar si es necesario
+            if not self.connection or not self.connection.is_open:
+                if not self.open():
+                    return None
+                    
+            # Crear mensaje
             message = Message.create(self.channel, payload)
             message.reply_to = self.callback_queue
-            # Create an entry in our local dictionary, using the automatically
-            # generated correlation_id as our key.
+            
+            # Crear entrada en diccionario
             self.queue[message.correlation_id] = None
-            # Publish the RPC request.
+            
+            # Publicar solicitud
             message.publish(routing_key=self.rpc_queue)
-            # Return the Unique ID used to identify the request.
+            
             return message.correlation_id
         except Exception as e:
-            print(f"Error al enviar solicitud: {str(e)}")
+            APP_STATUS["errors"] += 1
+            APP_STATUS["last_error"] = str(e)
+            print(f"[Cliente] Error al enviar solicitud: {str(e)}")
+            
+            # Intentar reconectar
+            self._reconnect()
             return None
 
     def is_connected(self):
-        """Verificar si el cliente está conectado a RabbitMQ."""
+        """Verificar conexión"""
         return self.connection and self.connection.is_open
 
-# Servidor RPC
+    def close(self):
+        """Cerrar conexión"""
+        self.should_reconnect = False
+        if self.connection:
+            try:
+                self.connection.close()
+            except:
+                pass
+        APP_STATUS["client_connected"] = False
+
+
+# Clase de Servidor RPC mejorada
 class TextProcessingServer(object):
-    """Servidor RPC para operaciones de procesamiento de texto."""
-    
-    def __init__(self, host, username, password, rpc_queue, vhost, port=5671, ssl=True):
+    def __init__(self, host, username, password, rpc_queue, vhost, port=5671, ssl=True, heartbeat=30):
         self.host = host
         self.username = username
         self.password = password
@@ -122,75 +238,140 @@ class TextProcessingServer(object):
         self.vhost = vhost
         self.port = port
         self.ssl = ssl
+        self.heartbeat = heartbeat
         self.connection = None
         self.channel = None
+        self.should_reconnect = True
+        self.heartbeat_thread = None
         
     def start(self):
-        """Iniciar el servidor RPC."""
+        """Iniciar servidor con manejo de errores"""
+        while self.should_reconnect:
+            try:
+                print(f"[Servidor] Conectando a RabbitMQ: {self.host}:{self.port}")
+                # Crear conexión con heartbeat reducido
+                self.connection = amqpstorm.Connection(
+                    self.host, 
+                    self.username,
+                    self.password,
+                    virtual_host=self.vhost,
+                    port=self.port,
+                    ssl=self.ssl,
+                    heartbeat=self.heartbeat
+                )
+                
+                # Crear canal
+                self.channel = self.connection.channel()
+                
+                # Declarar cola
+                self.channel.queue.declare(self.rpc_queue)
+                
+                # Configurar QoS
+                self.channel.basic.qos(prefetch_count=1)
+                
+                # Iniciar hilo de heartbeat
+                self._create_heartbeat_thread()
+                
+                # Configurar consumidor
+                self.channel.basic.consume(self._process_request, self.rpc_queue)
+                
+                print(f"[Servidor] Iniciado. Esperando mensajes en '{self.rpc_queue}'")
+                APP_STATUS["server_running"] = True
+                
+                # Iniciar consumo
+                self.channel.start_consuming()
+                
+            except KeyboardInterrupt:
+                print("[Servidor] Detenido por el usuario")
+                self.should_reconnect = False
+                break
+                
+            except Exception as e:
+                APP_STATUS["server_running"] = False
+                APP_STATUS["errors"] += 1
+                APP_STATUS["last_error"] = str(e)
+                print(f"[Servidor] Error: {str(e)}")
+                
+                # Limpiar conexiones
+                try:
+                    if self.connection:
+                        self.connection.close()
+                except:
+                    pass
+                    
+                # Esperar antes de reconectar
+                print("[Servidor] Esperando para reconectar...")
+                time.sleep(5)
+                
+    def _create_heartbeat_thread(self):
+        """Crear hilo para enviar heartbeats"""
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            return
+            
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop)
+        self.heartbeat_thread.daemon = True
+        self.heartbeat_thread.start()
+                
+    def _heartbeat_loop(self):
+        """Enviar heartbeats periódicamente"""
+        while self.should_reconnect:
+            try:
+                if self.connection and self.connection.is_open:
+                    # Enviar heartbeat manual
+                    self.connection.heartbeat.send_heartbeat()
+            except Exception as e:
+                APP_STATUS["errors"] += 1
+                APP_STATUS["last_error"] = f"Servidor heartbeat error: {str(e)}"
+                print(f"[Servidor] Error en heartbeat: {str(e)}")
+                
+            # Dormir por menos tiempo que el intervalo de heartbeat
+            time.sleep(self.heartbeat // 2)
+        
+    def _process_request(self, message):
+        """Procesar solicitudes con manejo de errores"""
         try:
-            # Crear conexión con soporte SSL/TLS
-            self.connection = amqpstorm.Connection(
-                self.host, 
-                self.username,
-                self.password,
-                virtual_host=self.vhost,
-                port=self.port,
-                ssl=self.ssl
+            # Extraer payload
+            payload = message.body
+            print(f"[Servidor] Solicitud recibida: {payload}")
+            
+            # Procesar texto
+            response = self._process_text(payload)
+            
+            # Crear respuesta
+            response_message = Message.create(
+                message.channel,
+                response
             )
-            # Crear canal
-            self.channel = self.connection.channel()
-            # Declarar la cola de solicitudes
-            self.channel.queue.declare(self.rpc_queue)
-            # Establecer QoS
-            self.channel.basic.qos(prefetch_count=1)
-            # Comenzar a consumir mensajes
-            self.channel.basic.consume(self._process_request, self.rpc_queue)
             
-            print(f"[x] Servidor de Procesamiento de Texto iniciado. Esperando mensajes en la cola '{self.rpc_queue}'...")
-            SERVER_STATUS["running"] = True
+            # Configurar propiedades
+            response_message.correlation_id = message.correlation_id
+            response_message.properties['delivery_mode'] = 2
             
-            # Iniciar el consumo de mensajes
-            self.channel.start_consuming()
+            # Publicar respuesta
+            response_message.publish(routing_key=message.reply_to)
+            print(f"[Servidor] Respuesta enviada: {response}")
+            
+            # Confirmar mensaje
+            message.ack()
+            
+            # Actualizar estadísticas
+            APP_STATUS["processed_messages"] += 1
             
         except Exception as e:
-            SERVER_STATUS["running"] = False
-            SERVER_STATUS["errors"] += 1
-            print(f"Error en el servidor RPC: {str(e)}")
+            APP_STATUS["errors"] += 1
+            APP_STATUS["last_error"] = str(e)
+            print(f"[Servidor] Error procesando solicitud: {str(e)}")
             
-    def _process_request(self, message):
-        """Procesar solicitudes RPC entrantes."""
-        # Extraer el cuerpo del mensaje (payload)
-        payload = message.body
-        print(f"[.] Solicitud recibida: {payload}")
-        
-        # Procesar el texto según el comando
-        response = self._process_text(payload)
-        
-        # Crear un mensaje de respuesta
-        response_message = Message.create(
-            message.channel,
-            response
-        )
-        
-        # Establecer el correlation_id y responder a la cola de callback apropiada
-        response_message.correlation_id = message.correlation_id
-        response_message.properties['delivery_mode'] = 2  # Hacer el mensaje persistente
-        
-        # Publicar el mensaje de respuesta
-        response_message.publish(routing_key=message.reply_to)
-        print(f"[x] Respuesta enviada: {response}")
-        
-        # Confirmar el mensaje
-        message.ack()
-        
-        # Actualizar estadísticas
-        SERVER_STATUS["processed_messages"] += 1
+            # Intentar confirmar el mensaje
+            try:
+                message.ack()
+            except:
+                pass
         
     def _process_text(self, payload):
-        """Procesar el texto según el comando proporcionado."""
-        # Formato esperado: "comando:texto"
+        """Procesar texto según comando"""
         try:
-            # Dividir el payload en comando y texto
+            # Dividir payload
             parts = payload.split(':', 1)
             
             if len(parts) < 2:
@@ -199,7 +380,7 @@ class TextProcessingServer(object):
             comando = parts[0].lower()
             texto = parts[1]
             
-            # Procesar según el comando
+            # Procesar según comando
             if comando == "mayusculas":
                 return texto.upper()
             elif comando == "minusculas":
@@ -224,39 +405,6 @@ class TextProcessingServer(object):
                 return f"ERROR: Comando desconocido '{comando}'"
         except Exception as e:
             return f"ERROR: {str(e)}"
-
-# Iniciar el servidor RPC en un hilo separado
-def start_rpc_server():
-    server = TextProcessingServer(
-        RABBIT_HOST, 
-        RABBIT_USER, 
-        RABBIT_PASSWORD, 
-        RPC_QUEUE,
-        RABBIT_VHOST,
-        RABBIT_PORT,
-        RABBIT_SSL
-    )
-    try:
-        server.start()
-    except Exception as e:
-        print(f"Error en el servidor RPC: {str(e)}")
-        SERVER_STATUS["running"] = False
-
-# Crear e iniciar el hilo del servidor
-rpc_server_thread = threading.Thread(target=start_rpc_server)
-rpc_server_thread.daemon = True
-rpc_server_thread.start()
-
-# Crear cliente RPC
-RPC_CLIENT = RpcClient(
-    RABBIT_HOST, 
-    RABBIT_USER, 
-    RABBIT_PASSWORD, 
-    RPC_QUEUE, 
-    RABBIT_VHOST,
-    RABBIT_PORT,
-    RABBIT_SSL
-)
 
 # Lista de operaciones disponibles
 TEXT_OPERATIONS = [
@@ -283,27 +431,66 @@ def save_history(operation, input_text, result):
         'result': result
     }
     
-    session['history'] = [history_item] + session['history'][:19]  # Guardar los últimos 20
+    session['history'] = [history_item] + session['history'][:19]
     session.modified = True
 
+# Iniciar servidor en hilo separado
+def start_rpc_server():
+    server = TextProcessingServer(
+        RABBIT_HOST, 
+        RABBIT_USER, 
+        RABBIT_PASSWORD, 
+        RPC_QUEUE,
+        RABBIT_VHOST,
+        RABBIT_PORT,
+        RABBIT_SSL,
+        HEARTBEAT_INTERVAL
+    )
+    try:
+        server.start()
+    except Exception as e:
+        APP_STATUS["server_running"] = False
+        APP_STATUS["errors"] += 1
+        APP_STATUS["last_error"] = str(e)
+        print(f"[Servidor] Error fatal: {str(e)}")
+
+# Crear e iniciar hilo de servidor
+print("[App] Iniciando servidor RPC en hilo separado...")
+rpc_server_thread = threading.Thread(target=start_rpc_server)
+rpc_server_thread.daemon = True
+rpc_server_thread.start()
+
+# Crear cliente RPC
+print("[App] Creando cliente RPC...")
+RPC_CLIENT = RpcClient(
+    RABBIT_HOST, 
+    RABBIT_USER, 
+    RABBIT_PASSWORD, 
+    RPC_QUEUE, 
+    RABBIT_VHOST,
+    RABBIT_PORT,
+    RABBIT_SSL,
+    HEARTBEAT_INTERVAL
+)
+
+# Rutas de la aplicación
 @app.route('/')
 def index():
-    """Página principal."""
-    connected = RPC_CLIENT.is_connected()
-    server_running = SERVER_STATUS["running"]
+    """Página principal"""
+    connected = APP_STATUS["client_connected"] and APP_STATUS["server_running"]
     return render_template('index.html', 
                           operations=TEXT_OPERATIONS, 
-                          connected=connected and server_running,
+                          connected=connected,
                           history=session.get('history', []))
 
 @app.route('/about')
 def about():
-    """Página acerca de."""
+    """Página acerca de"""
     return render_template('about.html')
 
 @app.route('/process', methods=['POST'])
 def process_text():
-    """Procesar texto vía RPC."""
+    """Procesar texto vía RPC"""
     operation = request.form.get('operation')
     text = request.form.get('text')
     
@@ -321,38 +508,42 @@ def process_text():
     # Preparar payload
     payload = f"{operation}:{text}"
     
-    # Enviar solicitud RPC
+    # Enviar solicitud
     corr_id = RPC_CLIENT.send_request(payload)
     
     if not corr_id:
         flash('Error al enviar la solicitud', 'danger')
         return redirect(url_for('index'))
     
-    # Esperar respuesta (con timeout)
-    max_wait = 100  # 10 segundos máximo
+    # Esperar respuesta con timeout
+    max_wait = 100  # 10 segundos
     counter = 0
     
-    while RPC_CLIENT.queue[corr_id] is None:
+    while counter < max_wait:
+        if corr_id in RPC_CLIENT.queue and RPC_CLIENT.queue[corr_id] is not None:
+            break
         sleep(0.1)
         counter += 1
-        if counter >= max_wait:
-            flash('Tiempo de espera agotado. No se recibió respuesta del servidor', 'warning')
-            return redirect(url_for('index'))
+    
+    # Verificar timeout
+    if counter >= max_wait or RPC_CLIENT.queue.get(corr_id) is None:
+        flash('Tiempo de espera agotado. No se recibió respuesta del servidor', 'warning')
+        return redirect(url_for('index'))
     
     # Obtener resultado
     result = RPC_CLIENT.queue[corr_id]
     
-    # Encontrar el nombre descriptivo de la operación
+    # Obtener nombre de operación
     operation_name = operation
     for op in TEXT_OPERATIONS:
         if op['id'] == operation:
             operation_name = op['name']
             break
     
-    # Guardar en historial
+    # Guardar historial
     save_history(operation_name, text, result)
     
-    # Si es AJAX, devolver JSON
+    # Responder según tipo de solicitud
     if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
         return jsonify({
             'success': True,
@@ -360,45 +551,48 @@ def process_text():
             'result': result
         })
     
-    # Si no es AJAX, redireccionar con mensaje
     flash(f'Operación completada: {operation_name}', 'success')
     return redirect(url_for('index'))
 
 @app.route('/clear-history', methods=['POST'])
 def clear_history():
-    """Borrar historial de operaciones."""
+    """Borrar historial"""
     session.pop('history', None)
     flash('Historial eliminado', 'info')
     return redirect(url_for('index'))
 
 @app.route('/health')
 def health_check():
-    """Verificar estado de la aplicación y conexión RPC."""
+    """Verificar salud"""
     return jsonify({
         'app': 'ok',
-        'rpc_connected': RPC_CLIENT.is_connected(),
-        'server_running': SERVER_STATUS["running"],
-        'processed_messages': SERVER_STATUS["processed_messages"]
+        'client_connected': APP_STATUS["client_connected"],
+        'server_running': APP_STATUS["server_running"],
+        'processed_messages': APP_STATUS["processed_messages"]
     })
 
 @app.route('/status')
 def status():
-    """Página de estado detallado."""
+    """Estado detallado"""
     return jsonify({
-        'client': {
-            'connected': RPC_CLIENT.is_connected(),
-            'host': RABBIT_HOST,
-            'queue': RPC_QUEUE
-        },
-        'server': SERVER_STATUS,
+        'status': APP_STATUS,
         'rabbit': {
             'host': RABBIT_HOST,
             'vhost': RABBIT_VHOST,
             'port': RABBIT_PORT,
-            'ssl': RABBIT_SSL
-        }
+            'ssl': RABBIT_SSL,
+            'heartbeat': HEARTBEAT_INTERVAL
+        },
+        'queue': RPC_QUEUE
     })
 
+@app.route('/ping')
+def ping():
+    """Endpoint simple para mantener la aplicación activa"""
+    return "pong"
+
+# Iniciar aplicación
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    print(f"[App] Iniciando aplicación web en puerto {port}")
     app.run(host='0.0.0.0', port=port)
